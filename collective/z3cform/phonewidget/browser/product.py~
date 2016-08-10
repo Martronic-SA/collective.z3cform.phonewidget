@@ -1,0 +1,261 @@
+from money import Money
+import logging
+import zope.interface
+from zope.interface import implements
+import zope.component
+import xmlrpclib
+import zope.schema.interfaces
+from zope import component, schema, interface
+from zope.component import getMultiAdapter
+from zope.schema import getFieldsInOrder, getFieldNames
+from zope.schema.interfaces import IList
+from zope.schema.fieldproperty import FieldProperty
+from z3c.form.object import SubformAdapter, makeDummyObject
+from z3c.form.interfaces import INPUT_MODE, DISPLAY_MODE, IFormLayer
+from z3c.form.widget import FieldWidget
+from z3c.form import form, field, button, subform, datamanager
+from z3c.form.i18n import MessageFactory as _z3c
+from plone.dexterity.browser import add, edit
+from Products.CMFCore.utils import getToolByName
+from Products.CMFPlone.utils import normalizeString, safe_unicode, utf8_portal, getSiteEncoding
+from Products.Five.browser.pagetemplatefile import ViewPageTemplateFile
+from collective.z3cform.datagridfield.datagridfield import DataGridField, DataGridFieldObject, DataGridFieldObjectSubForm
+from Products.CMFPlone import PloneLocalesMessageFactory as PLMF
+from zope.component.hooks import getSite
+from zope.i18nmessageid import MessageFactory
+from collective.z3cform.datagridfield import DataGridFieldFactory
+from Products.Five.browser import BrowserView
+from plone.autoform.form import AutoExtensibleForm
+from plone.memoize.view import memoize
+from plone.app.z3cform.inline_validation import InlineValidationView
+_p = MessageFactory('plone')
+_z3cf = MessageFactory('z3c.form')
+from Martronic.Odoo4Plone.config import _
+from urllib2 import Request, urlopen, URLError
+import urllib, urllib2
+import time
+from urllib import urlencode
+import cookielib
+from urlparse import urlparse
+from oerplib.rpc.jsonrpclib import Proxy
+from oerplib import OERP
+from cookielib import Cookie
+try:
+    import json
+except:
+    import simplejson as json
+
+from Martronic.Odoo4Plone import interfaces as o4pi
+import interfaces
+
+LOG = logging.getLogger(__name__)
+
+class GetOdooProductData(BrowserView):
+    odoo_context = {}
+        
+    def __call__(self):
+        portal = getSite()
+        config = o4pi.IOdooSettings(portal)
+        if not config.http_host:
+            return None
+        product_id = self.request.get('product_id')
+        if not product_id:
+            return None
+        conn = OERP(server=config.http_host, database=config.dbname, port=config.http_address)
+        main_user = conn.login(user=config.username, passwd=config.password)
+        data = conn.read('product.product', int(product_id))
+        return json.dumps(data, sort_keys=False)
+
+class ProductView(BrowserView):
+    """Product View"""
+
+    def __init__(self, context, request):
+        super(ProductView, self).__init__(context, request)
+        self.odoo_state = getMultiAdapter((self.context, self.request), name=u'odoo_state')
+        self.product_state = self.odoo_state.getOdooProductState(self.context.product_id)
+
+        
+class ProductForm(object):
+
+    def java(self):
+        return """
+        <script type="text/javascript">
+        $("select[name='form.widgets.product_id:list']").change(function(){
+            $('#kss-spinner').show();
+            $('#ajax-spinner').show();
+            var odoo_config = $("select[name='form.widgets.odoo_config:list']").val();
+            var product_id = $("select[name='form.widgets.product_id:list']").val();
+            var odoodata = 'odoo_config='+odoo_config+'&product_id='+product_id;
+            $.ajax({
+                cache:false,
+                url: portal_url+'/@@get-odoo-product-data',
+                dataType:"json",
+                global: false,
+                type: "POST",
+                data: odoodata,
+                success: function(resp) {
+                    $("input[name='form.widgets.id']").attr('value', resp['name_template'].toString());
+                    $("input[name='form.widgets.IDublinCore.title']").attr('value', resp['name_template'].toString());
+                    $('div[id="formfield-form-widgets-IRichText-text"]').find('iframe').contents().find("body").html(resp['website_description']);
+                    $("textarea[name='form.widgets.IDublinCore.description']").html(resp['description_sale']);
+                    $('#ajax-spinner').hide();
+                    $('#kss-spinner').hide();
+                }
+            });
+        });
+        </script>
+        """
+
+class ProductAddForm(add.DefaultAddForm, ProductForm):
+    portal_type = 'Martronic.Odoo4Plone.Product'
+
+    def render(self):
+        return super(ProductAddForm, self).render()+self.java()
+
+class ProductAddView(add.DefaultAddView):
+
+    form = ProductAddForm
+
+class ProductEditForm(edit.DefaultEditForm, ProductForm):
+    portal_type = 'Martronic.Odoo4Plone.Product'
+
+    def render(self):
+        return super(ProductEditForm, self).render()+self.java()
+
+class ProductEditView(edit.DefaultEditView):
+
+    form = ProductEditForm
+
+class OdooProductState(BrowserView):
+    """Information about the state of the product
+    """
+
+    implements(interfaces.IOdooProductState)
+    
+    def __init__(self, context, request, product_id=None):
+        super(OdooProductState, self).__init__(context, request)
+        self.product_id = product_id
+        if self.product_id == None and self.request.get('product_id') != None:
+            try:
+                val = self.request.get('product_id')
+                if isinstance(val, list):
+                    val = val[0]
+                self.product_id = int(val)
+            except:
+                pass
+        if self.product_id == None and self.request.get('form.widgets.product_id'):
+            try:
+                val = self.request.get('form.widgets.product_id')
+                if isinstance(val, list):
+                    val = val[0]
+                self.product_id = int(val)
+            except:
+                pass
+        if self.product_id == None:
+            try:
+                self.product_id = int(self.context.product_id)
+            except:
+                raise ValueError('Product ID wrong or missing!')
+        LOG.info('GETTING DATA ON INIT FOR '+str(self.product_id))
+        self.data = self.getProductData(self.product_id)
+        LOG.info(self.data)
+
+    @memoize
+    def getProductData(self, product_id):
+        LOG.info('GETTING PRODUCT DATA')
+        return self.callProxy('/odoo4plone/product_json', params={'product_id':product_id})
+
+    @memoize
+    def updateProductData(self, product_id):
+        LOG.info('UPDATING PRODUCT DATA')
+        self.product_id = product_id
+        if hasattr(self.context, 'set_qty'):
+            self.context.product_id = int(product_id)
+        self.data = self.callProxy('/odoo4plone/product_json', params={'product_id':self.product_id})
+        return self.data
+
+    def formatMoney(self, amount):
+        m = Money(amount, self.data['currency_name'])
+        return m.format(self.locale)
+
+    def updateCart(self, product_id=None, add_qty=1, set_qty=None, **kwargs):
+        if product_id == None:
+            product_id = self.product_id
+        values = {'product_id':product_id,
+                  'add_qty':add_qty,
+                  'set_qty':set_qty}
+        values.update(kwargs)
+        return self.callProxy(url='/odoo4plone/cart/update_json', params=values)
+        
+    @property
+    def title(self):
+        if self.data['name']:
+            return self.data['name']
+        return ''
+
+    @property
+    def description(self):
+        if self.data['description']:
+            return self.data['description']
+        return ''
+
+    @property
+    def price(self):
+        return self.data['price']
+
+    @property
+    def priceFormatted(self):
+        return self.formatMoney(self.price)
+
+    @property
+    def lst_price(self):
+        return self.data['lst_price']
+
+    @property
+    def lst_priceFormatted(self):
+        return self.formatMoney(self.lst_price)
+
+    @property
+    def hasDiscount(self):
+        return self.data['lst_price']-self.data['price'] > 0.01
+
+    @property
+    def currency_name(self):
+        return self.data['currency_name']
+
+    @property
+    def unit(self):
+        return self.data['unit']
+
+    #possible variants for this product including self variant    
+    @property
+    def variants(self):
+        return self.data['variants']
+    
+    #current product attributes
+    @property
+    def attributes(self):
+        return self.data['attributes']
+    
+    @property
+    def variant_ids(self):
+        return self.data['variant_ids']
+
+    def getAttributes(self):
+        attrs = {}
+        for variant in self.variants:
+            for k,v in variant['attribute_values'].items():
+                if attrs.get(k) == None:
+                    attrs[k] = {'type':v['type'],
+                                  'name':v['name'],
+                                  'attribute_id':v['attribute_id'],
+                                  'values':{}}
+                value = {'value':v['value'],
+                         'color':v['color'],
+                         'id':v['id'],
+                         'price_extra':v['price_extra'],
+                         'price_extra_formatted':self.formatMoney(v['price_extra'])}
+                if v['id'] not in attrs[k]['values'].keys():
+                    attrs[k]['values'][v['id']] = value
+        return attrs
+

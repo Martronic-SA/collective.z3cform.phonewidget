@@ -1,0 +1,406 @@
+import logging
+import zope.interface
+from zope.interface import implements
+import zope.component
+import xmlrpclib
+import zope.schema.interfaces
+from zope import component, schema, interface
+from zope.component import getMultiAdapter, getAdapters
+from zope.schema import getFieldsInOrder, getFieldNames
+from zope.schema.interfaces import IList
+from zope.schema.fieldproperty import FieldProperty
+from z3c.form.object import SubformAdapter, makeDummyObject
+from z3c.form.interfaces import INPUT_MODE, DISPLAY_MODE, HIDDEN_MODE, IFormLayer
+from z3c.form.widget import FieldWidget
+from z3c.form import form, field, button, subform, datamanager
+from z3c.form.i18n import MessageFactory as _z3c
+from z3c.form.interfaces import NO_VALUE
+from plone.z3cform.crud import crud
+from plone.z3cform import layout
+from plone.z3cform.layout import FormWrapper
+from plone.dexterity.browser import add
+from Products.CMFCore.utils import getToolByName
+from Products.CMFPlone.utils import normalizeString, safe_unicode, utf8_portal, getSiteEncoding
+from Products.Five.browser.pagetemplatefile import ViewPageTemplateFile
+from collective.z3cform.datagridfield.datagridfield import DataGridField, DataGridFieldObject, DataGridFieldObjectSubForm
+from Products.CMFPlone import PloneLocalesMessageFactory as PLMF
+from zope.component.hooks import getSite
+from zope.i18nmessageid import MessageFactory
+from collective.z3cform.datagridfield import DataGridFieldFactory
+from Products.Five.browser import BrowserView
+from plone.autoform.form import AutoExtensibleForm
+try:
+    import json
+except:
+    import simplejson as json
+
+_p = MessageFactory('plone')
+_z3cf = MessageFactory('z3c.form')
+from Martronic.Odoo4Plone.config import _
+from urllib2 import Request, urlopen, URLError
+import urllib, urllib2
+import time
+from urllib import urlencode
+import cookielib
+from urlparse import urlparse
+from oerplib.rpc.jsonrpclib import Proxy
+from oerplib import OERP
+from cookielib import Cookie
+from widgets import PriceFieldWidget, QuantityFieldWidget, ProductVariantFieldWidget, AddToCartFieldWidget
+
+from Martronic.Odoo4Plone import interfaces as o4pi
+from Martronic.Odoo4Plone.viewlets.product import ProductAttributesForm
+from interfaces import ICart, Cart, CartLine, ICartLine, IOptionLine, ICartFromLayer
+
+LOG = logging.getLogger(__name__)
+
+
+class CartUpdate(BrowserView):
+
+    def __call__(self):
+        product_id = getattr(self.context, 'product_id', self.request.get('product_id'))
+        if not product_id:
+            self.pu.addPortalMessage(_('product_id_missing_error', default="No Product provided."), type='error')
+            return self.request.response.redirect(self.context.absolute_url())
+        data = {'add_qty':self.request.get('add_qty', 1),
+                'product_id':product_id}
+        self.odoo_state = getMultiAdapter((self.context, self.request), name=u'odoo_state')
+        sale_order = self.odoo_state.callProxy(url='/odoo4plone/cart/update_json', params=data) 
+        return self.request.response.redirect(self.portal_url+'/@@cart-form?came_from='+self.context.absolute_url())
+
+
+class CartLineEditSubForm(crud.EditSubForm):
+    template = ViewPageTemplateFile('templates/cart-row.pt')
+
+    position = 0
+    
+    @property
+    def klass(self):
+        klass = 'table-row'
+        if getattr(self.content, 'linked_line_id', []):
+            klass += ' option'
+        extra = self.position%2 == 0 and ' odd' or ' even'
+        klass += extra
+        return klass
+
+    @property
+    def product_state(self):
+        return self.content
+
+    @property
+    def odoo_state(self):
+        return self.context.context.context.odoo_state
+        
+    @property
+    def fields(self):
+        fields = super(CartLineEditSubForm, self).fields
+        fields['set_qty'].widgetFactory = QuantityFieldWidget
+        return fields
+        
+    def updateWidgets(self):
+        super(CartLineEditSubForm, self).updateWidgets()
+        if not self.widgets.get("view_price_reduce_formatted"):
+            self.widgets["view_price_formatted"].price_reduce_formatted = self.content.price_reduce_formatted
+            self.widgets["view_price_formatted"].hasDiscount = self.content.hasDiscount
+        if getattr(self.content, 'linked_line_id', []) and IOptionLine.providedBy(self.content):
+            self.widgets["set_qty"].mode = DISPLAY_MODE
+        for k,v in self.widgets.items():
+            v.klass += ' '+k
+#        self.widgets["id"].mode = HIDDEN_MODE
+
+    def applyChanges(self, data):
+        LOG.info(data)
+        if int(data['set_qty']) != int(self.content.set_qty):
+            data = {'set_qty':int(data['set_qty']),
+                    'product_id':int(self.content.product_id),
+                    'line_id':int(self.content.id)}
+            base_data = self.odoo_state.callProxy(url='/odoo4plone/cart/update_json', params=data)
+            for option_id, product_id in self.content.option_line_ids.items():
+                ldata = {'set_qty':int(data['set_qty']),
+                         'product_id':int(product_id),
+                         'line_id':int(option_id)}
+                new_data = self.odoo_state.callProxy(url='/odoo4plone/cart/update_json', params=ldata)['lines']
+        return True
+
+    @button.buttonAndHandler(_('Apply changes on line'),
+                             name='ajax_line_edit')
+    def ajax_line_edit(self, action):
+        LOG.info('Apply changes on line')
+        data, errors = subform.extractData()
+        self.applyChanges(self, data)
+
+
+class OptionLineEditSubForm(CartLineEditSubForm):
+    template = ViewPageTemplateFile('templates/cart-row.pt')
+
+    @property
+    def fields(self):
+        fields = super(OptionLineEditSubForm, self).fields
+        for f in fields.values():
+            if f.__name__ == "view_product_id" and len(self.content.variants) > 1:
+                f.__name__ = 'product_id'
+                f.mode = INPUT_MODE
+                f.default = self.content.product_id
+        fields['view_price_subtotal_formatted'].widgetFactory = AddToCartFieldWidget
+        fields['select'].mode = DISPLAY_MODE
+        fields['select'].default = False
+        return fields
+
+    def updateContent(self, product_id=None):
+        if product_id == None:
+            attrWidget = self.fields["view_product_id"].widgetFactory.get(INPUT_MODE)(self.fields["view_product_id"].field, self.request)
+            attrWidget.context = self.content
+            attrWidget.form = self
+            attrWidget.update()
+            product_id = attrWidget.extract()
+        if product_id != None and product_id != NO_VALUE:
+            odoo_state = getMultiAdapter((self.context, self.request), name=u'odoo_state')
+            self.content = odoo_state.getOptionLineObject(self.content, product_id)
+
+    def updateWidgets(self):
+        #first of all, update the attributes form to know if we have to look for another product data
+        if self.content.temporary:
+            self.updateContent()
+        super(OptionLineEditSubForm, self).updateWidgets()
+#        self.widgets["view_attributes"] = ProductAttributesForm(self.context.context.context, self.request, self)
+#        self.widgets["view_attributes"].update()
+
+    def applyChanges(self, data):
+#        LOG.info('Option applyChanges')
+#        LOG.info(data)
+#        data = {'set_qty':int(data['set_qty']),
+#                'product_id':int(self.content.product_id),
+#                'line_id':int(self.content.id)}
+#        sale_order = self.context.context.context.callProxy(url='/odoo4plone/cart/update_json', params=data)
+        return True
+
+
+class CartLineEditForm(crud.EditForm):
+    template = ViewPageTemplateFile('templates/cart-table.pt')
+    label = None
+    line_editsubform_factory = CartLineEditSubForm
+    option_editsubform_factory = OptionLineEditSubForm
+
+    def _update_subforms(self):
+        self.subforms = []
+        i = 0
+        for id, item in self.batch:
+            LOG.info(id)
+            LOG.info(item)
+            if IOptionLine.providedBy(item):
+                factory = self.option_editsubform_factory
+            else:
+                factory = self.line_editsubform_factory
+            subform = factory(self, self.request)
+            subform.content = item
+            subform.content_id = id
+            subform.position = i
+            subform.update()
+            i += 1
+            self.subforms.append(subform)
+
+    def handle_edit(self, action):
+        success = _(u"Successfully updated")
+        partly_success = _(u"Some of your changes could not be applied.")
+        status = no_changes = _(u"No changes made.")
+        linked_line_qty = {}
+        for subform in self.subforms:
+            data, errors = subform.extractData()
+            if errors:
+                if status is no_changes:
+                    status = subform.formErrorsMessage
+                elif status is success:
+                    status = partly_success
+                continue
+            del data['select']
+            self.context.before_update(subform.content, data)
+            #we hope main line is always treated before option line...
+            if getattr(subform.content, 'option_line_ids', []):
+                linked_line_qty[subform.content.id] = data['set_qty']
+            if getattr(subform.content, 'linked_line_id', None):
+                data['set_qty'] = linked_line_qty[subform.content.linked_line_id]
+            changes = subform.applyChanges(data)
+            if changes:
+                if status is no_changes:
+                    status = success
+                elif status is subform.formErrorsMessage:
+                    status = partly_success
+
+                # If there were changes, we'll update the view widgets
+                # again, so that they'll actually display the changes
+                for widget in  subform.widgets.values():
+                    if widget.mode == DISPLAY_MODE:
+                        widget.update()
+                        zope.event.notify(z3c.form.widget.AfterWidgetUpdateEvent(widget))
+        self.status = status
+
+class CartLinesForm(crud.CrudForm):
+    update_schema = field.Fields(ICartLine).select('set_qty')
+    update_schema['set_qty'].widgetFactory = QuantityFieldWidget
+    editform_factory = CartLineEditForm
+    price_with_discount = True # might come from configuration ?
+
+    def __init__(self, context, request):
+        super(CartLinesForm, self).__init__(context, request)
+
+    @property
+    def view_schema(self):
+        fields = field.Fields(ICartLine).select('id', 'product_id', 'unit', 'name', 'description', 'price_formatted', 'price_reduce_formatted', 'price_subtotal_formatted')
+        fields['price_formatted'].widgetFactory = PriceFieldWidget
+        fields['price_reduce_formatted'].widgetFactory = PriceFieldWidget
+        fields['price_subtotal_formatted'].widgetFactory = PriceFieldWidget
+        fields["product_id"].widgetFactory = ProductVariantFieldWidget
+        if self.price_with_discount:
+            fields = fields.omit('price_reduce_formatted')
+        return fields
+
+    @property
+    def currency_name(self):
+        return self.context.cart.currency
+
+    def amount_total(self):
+        return self.context.cart.amount_total_formatted
+
+    def get_items(self):
+        return [(i, self.context.cart.lines[i]) for i in range(len(self.context.cart.lines))]
+
+    def remove(self, (id, item)):
+        data = {'set_qty':0,
+                'product_id':item.product_id,
+                'line_id':id}
+        self.context.odoo_state.callProxy(url='/odoo4plone/cart/update_json', params=data)
+
+    def update(self):
+        form.Form.update(self)
+        editform = self.editform_factory(self, self.request)
+        editform.update()
+        self.subforms = [editform,]
+
+    def link(self, item, field):
+        if field == 'name' and item.link:
+            return item.link
+        return None
+
+class CartForm(form.Form):
+    template = ViewPageTemplateFile("templates/cartform.pt")
+    fields = field.Fields(ICart).select('amount_total_formatted', 'amount_untaxed_formatted', 'amount_tax_formatted')
+    cartlinesform_factory = CartLinesForm
+    ignoreRequest = True
+
+    def __init__(self, context, request):
+        super(CartForm, self).__init__(context, request)
+        self.odoo_state = getMultiAdapter((self.context, self.request), name=u'odoo_state')
+    
+    @property
+    def label(self):
+        cart = self.getContent()
+        if len(cart.lines)==0:
+            return _('Your cart is empty')
+        return _('Your cart')
+        
+    def getContent(self):
+        return self.cart
+
+    def updateWidgets(self):
+        form.Form.updateWidgets(self)
+        for k,v in self.widgets.items():
+            v.klass += ' '+k
+            v.mode = DISPLAY_MODE
+
+    def update(self):
+        self.cart = self.odoo_state.getCart()
+        form.Form.update(self)
+        cartlinesform = self.cartlinesform_factory(self, self.request)
+        cartlinesform.update()
+        #Cart has been updated, reload for rendering (don't do that with javascripts)
+        if cartlinesform.subforms[0].status:
+            self.cart = self.odoo_state.getCart()
+            form.Form.update(self)
+            cartlinesform.update()
+        self.subforms = [cartlinesform,]
+
+# Create a form wrapper so the form gets layout.
+class CartFormPage(FormWrapper):
+    implements(ICartFromLayer)
+    form = CartForm
+    index = ViewPageTemplateFile('templates/cartform-wrapper.pt')
+
+class CartLineForm(CartLinesForm):
+
+    def get_items(self):
+        return [(i, self.lines[i]) for i in range(len(self.lines))]
+
+    def update(self):
+        line_id = self.request.get('line_id')
+        self.lines = [self.odoo_state.getLine(int(line_id)),]
+
+class CartFormAJAX(form.EditForm):
+    ignoreContext = True
+    fields = field.Fields(ICartLine).select('set_qty')
+
+    json_data = {}
+
+    def __init__(self, context, request):
+        super(CartFormAJAX, self).__init__(context, request)
+        self.odoo_state = getMultiAdapter((self.context, self.request), name=u'odoo_state')
+    
+    def updateCart(self, data):
+        base_data = self.odoo_state.updateCart(**data)
+        if data['line_id'] not in [a.get('id') for a in base_data['lines']]:
+            base_data['lines'].append({'id':data['line_id'], 'removed':True})
+        LOG.info(base_data)
+#        for updatedline in base_data['lines']:
+#            optline = updatedline.get('option_line_ids', [])
+#            if optline:
+#                optline_id = int(optline.keys()[0])
+#                ldata = {'set_qty':int(data['set_qty']),
+#                         'product_id':int(optline.values()[0]),
+#                         'line_id':optline_id}
+#                new_data = self.odoo_state.updateCart(**ldata)
+#                new_data['lines'] += base_data['lines']
+#                if optline_id not in [a.get('id') for a in new_data['lines']]:
+#                    new_data['lines'].append({'id':optline_id, 'removed':True})
+#                base_data = new_data
+        self.json_data = base_data
+        return True
+
+    def applyChanges(self, data):
+        line_id = int(self.prefix.split('.')[1])
+        data = {'set_qty':data.get('set_qty'),
+                'product_id':data.get('product_id'),
+                'line_id':line_id}
+        return self.updateCart(data)
+
+    @button.buttonAndHandler(_('Add to cart'), name='add')
+    def add(self, action):
+        line_id = int(self.prefix.split('.')[1])
+        product_id = int(self.prefix.split('.')[2].replace('option_',''))
+        data = {'linked_line_id':line_id,
+                'product_id':product_id}
+        return self.updateCart(data)
+
+    @button.buttonAndHandler(_('Remove'), name='remove')
+    def remove(self, action):
+        line_id = int(self.prefix.split('.')[1])
+        data = {'set_qty':0,
+                'line_id':line_id,
+                'product_id':None}
+        return self.updateCart(data)
+
+    @button.buttonAndHandler(_('Apply'), name='apply')
+    def handleApply(self, action):
+        data, errors = self.extractData()
+        if errors:
+            self.status = self.formErrorsMessage
+            return
+        changes = self.applyChanges(data)
+        if changes:
+            self.status = self.successMessage
+        else:
+            self.status = self.noChangesMessage
+
+    def __call__(self):
+        self.request.response.setHeader('X-Theme-Disabled', '1')
+        self.prefix = self.request.get('prefix', 'form')
+        self.update()
+        return json.dumps(self.json_data)

@@ -1,0 +1,200 @@
+from zope.interface import Interface, Attribute, directlyProvides, implements, alsoProvides
+from zope import schema, component
+from zope.schema.fieldproperty import FieldProperty
+from plone.directives import form
+from plone.autoform.interfaces import IFormFieldProvider, WIDGETS_KEY
+from plone.autoform import directives
+from plone.app.textfield import RichText
+from plone.supermodel import model
+from z3c.form.object import registerFactoryAdapter
+from z3c.form.interfaces import IFormLayer
+from collective.z3cform.datagridfield import DataGridFieldFactory, DictRow
+from Martronic.Odoo4Plone.config import _
+from Martronic.Odoo4Plone import interfaces as o4pi
+
+class IOdooState(Interface):
+    """Odoo state"""
+    
+class IOdooProductState(Interface):
+    """Product data coming from odoo"""
+    id = schema.Int(title = _(u"ID"), required=False)
+    name = schema.TextLine(title = _(u"Designation"), required=False)
+    description = schema.Text(title = _(u"Description"), required=False)
+    lst_price = schema.Float(title = _('Price'), required=False)
+    lst_price_formatted = schema.TextLine(title = _('Price'), required=False)
+    price = schema.Float(title = _('Price'), required=False)
+    price_formatted = schema.TextLine(title = _('Price'), required=False)
+    price_extra = schema.Float(title = _('Price Extra'), required=False)
+    price_extra_formatted = schema.TextLine(title = _('Price Extra'), required=False)
+    currency_name = schema.TextLine(title = _(u"Currency name"), required=False)
+    unit = schema.TextLine(title = _('Unit'), required=False)
+    variants = schema.List(title = _(u"Variants"), required=False)
+    variant_ids = schema.List(title = _(u"Variants IDs"), required=False)
+    attributes = schema.Dict(title = _(u"Attributes"), required=False)
+    option_ids = schema.List(title = _(u"Variants IDs"), required=False)
+
+class OdooProductState(object):
+    implements(IOdooProductState)
+    
+    def __init__(self, data):
+        for field in [IOdooProductState.get(name) for name in IOdooProductState.names() if schema.interfaces.IField.providedBy(IOdooProductState.get(name))]:
+            setattr(self, field.__name__, data.get(field.__name__))
+
+    def getAttributes(self):
+        attrs = {}
+        for variant in self.variants:
+            for k,v in variant['attribute_values'].items():
+                if attrs.get(k) == None:
+                    attrs[k] = {'type':v['type'],
+                                  'name':v['name'],
+                                  'attribute_id':v['attribute_id'],
+                                  'values':{}}
+                value = {'value':v['value'],
+                         'color':v['color'],
+                         'id':v['id'],
+                         'price_extra':v['price_extra'],
+                         'price_extra_formatted':v['price_extra_formatted']}
+                if v['id'] not in attrs[k]['values'].keys():
+                    attrs[k]['values'][v['id']] = value
+        return attrs
+
+    @property
+    def hasDiscount(self):
+        return self.lst_price-self.price > 0.01
+
+
+class ICartLine(form.Schema):
+
+    #if its an optional line, leave the id, product_id empty to be set and selected after 
+    id = schema.Int(title = _(u"ID"), required=False)
+    
+    option_id = schema.TextLine(title = _('Option ID'), required=False)
+
+    product_id = schema.Int(title = _(u"Variant"), required=True)
+    
+    set_qty = schema.Int(title = _('Quantity'), required=False)
+    
+    unit = schema.TextLine(title = _('Unit'), required=False)
+    
+    name = schema.TextLine(title = _(u"Designation"), required=False)
+    
+    description = schema.Text(title = _(u"Description"), required=False)
+    
+    attributes = schema.Dict(title = _(u"Attributes"), required=False)
+
+    variants = schema.List(title = _(u"Variants"), required=False)
+    
+    link = schema.TextLine(title = _(u"Link"), required=False)
+    
+    price = schema.Float(title = _('Price'), required=False)
+    
+    price_reduce = schema.Float(title = _('Price Reduce'), required=False)
+    
+    price_subtotal = schema.Float(title = _('Sub total'), required=False)
+    
+    price_formatted = schema.TextLine(title = _('Price'), required=False)
+    
+    price_reduce_formatted = schema.TextLine(title = _('Price Reduce'), required=False)
+    
+    price_subtotal_formatted = schema.TextLine(title = _('Sub total'), required=False)
+
+    currency_name = schema.TextLine(title = _(u"Currency name"), required=False)
+
+    linked_line_id = schema.Int(title=_('Linked line'), required=False)
+
+    option_line_ids = schema.Dict(title=_('Option lines'), required=False)
+
+
+class CartLine(object):
+    implements(ICartLine)
+    
+    def __init__(self, id=None, option_id='', product_id=None, set_qty=1, unit='', name='', description='',
+        attributes={}, variants=[], link='', price=0.0, price_reduce=0.0, price_subtotal=0.0,
+        price_formatted=0.0, price_reduce_formatted=0.0, price_subtotal_formatted=0.0,
+        currency_name='', linked_line_id=0, option_line_ids={}):
+        self.id=id
+        self.option_id = option_id
+        self.product_id=product_id
+        self.set_qty=set_qty
+        self.unit=unit
+        self.name=name
+        self.description=description
+        self.attributes=attributes
+        self.variants=variants
+        self.link=link
+        self.price=price
+        self.price_reduce=price_reduce
+        self.price_subtotal=price_subtotal
+        self.price_formatted=price_formatted
+        self.price_reduce_formatted=price_reduce_formatted
+        self.price_subtotal_formatted=price_subtotal_formatted
+        self.currency_name=currency_name
+        self.linked_line_id=linked_line_id
+        self.option_line_ids=option_line_ids
+
+    def getAttributes(self):
+        attrs = {}
+        for variant in self.variants:
+            for k,v in variant['attribute_values'].items():
+                if attrs.get(k) == None:
+                    attrs[k] = {'type':v['type'],
+                                  'name':v['name'],
+                                  'attribute_id':v['attribute_id'],
+                                  'values':{}}
+                value = {'value':v['value'],
+                         'color':v['color'],
+                         'id':v['id'],
+                         'price_extra':v['price_extra'],
+                         'price_extra_formatted':v['price_extra_formatted']}
+                if v['id'] not in attrs[k]['values'].keys():
+                    attrs[k]['values'][v['id']] = value
+        return attrs
+
+    @property
+    def hasDiscount(self):
+        return self.price-self.price_reduce > 0.01
+
+
+class IOptionLine(ICartLine):
+    """"""
+
+class OptionLine(object):
+    implements(IOptionLine)
+    temporary=True
+
+
+class ICart(form.Schema):
+
+    lines = schema.List(
+        title=_(u"Cart Lines"),
+        required=False,
+        value_type=schema.Object(title=u"tablerow", schema=ICartLine)
+    )
+
+    amount_total = schema.Float(title = _('TOTAL'))
+    amount_untaxed = schema.Float(title = _('Untaxed Amount'))
+    amount_tax = schema.Float(title = _('Tax amount'))
+    amount_total_formatted = schema.TextLine(title = _('TOTAL'))
+    amount_untaxed_formatted = schema.TextLine(title = _('Untaxed Amount'))
+    amount_tax_formatted = schema.TextLine(title = _('Tax amount'))
+    currency = schema.TextLine(title = _('Currency'))
+
+
+class Cart(object):
+    implements(ICart)
+
+    def __init__(self, lines=[], amount_untaxed=0.0, amount_tax=0.0, amount_total=0.0,
+            amount_untaxed_formatted='', amount_tax_formatted='', amount_total_formatted='', currency=u"USD"):
+        self.lines = lines
+        self.amount_untaxed = amount_untaxed
+        self.amount_tax = amount_tax
+        self.amount_total = amount_total
+        self.amount_untaxed_formatted = amount_untaxed_formatted
+        self.amount_tax_formatted = amount_tax_formatted
+        self.amount_total_formatted = amount_total_formatted
+        self.currency = currency
+
+
+class ICartFromLayer(IFormLayer):
+    """Cart form layer"""
+

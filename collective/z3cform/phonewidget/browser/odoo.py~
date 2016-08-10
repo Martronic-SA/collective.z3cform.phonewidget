@@ -1,0 +1,375 @@
+import sys, traceback
+import logging
+import zope.interface
+from zope.interface import implements
+import zope.component
+import xmlrpclib
+import zope.schema.interfaces
+from zope import component, schema, interface
+from zope.component import getMultiAdapter
+from zope.schema import getFieldsInOrder, getFieldNames
+from zope.schema.interfaces import IList
+from zope.schema.fieldproperty import FieldProperty
+from z3c.form.object import SubformAdapter, makeDummyObject
+from z3c.form.interfaces import INPUT_MODE, DISPLAY_MODE, IFormLayer
+from z3c.form.widget import FieldWidget
+from z3c.form import form, field, button, subform, datamanager
+from z3c.form.i18n import MessageFactory as _z3c
+from plone.dexterity.browser import add
+from plone.memoize.view import memoize
+from Products.CMFCore.utils import getToolByName
+from Products.CMFPlone.utils import normalizeString, safe_unicode, utf8_portal, getSiteEncoding
+from Products.Five.browser.pagetemplatefile import ViewPageTemplateFile
+from collective.z3cform.datagridfield.datagridfield import DataGridField, DataGridFieldObject, DataGridFieldObjectSubForm
+from Products.CMFPlone import PloneLocalesMessageFactory as PLMF
+from zope.component.hooks import getSite
+from zope.i18nmessageid import MessageFactory
+from collective.z3cform.datagridfield import DataGridFieldFactory
+from Products.Five.browser import BrowserView
+from plone.autoform.form import AutoExtensibleForm
+
+_p = MessageFactory('plone')
+_z3cf = MessageFactory('z3c.form')
+from Martronic.Odoo4Plone.config import _
+from urllib2 import Request, urlopen, URLError
+import urllib, urllib2
+import time
+import random
+from urllib import urlencode
+import cookielib
+from urlparse import urlparse
+from oerplib.rpc.jsonrpclib import Proxy
+from oerplib import OERP
+from cookielib import Cookie, CookieJar
+try:
+    import json
+except:
+    import simplejson as json
+
+from Martronic.Odoo4Plone import interfaces as o4pi
+from interfaces import Cart, CartLine, OptionLine, OdooProductState, IOdooState, IOdooProductState
+
+LOG = logging.getLogger(__name__)
+
+class OdooProxy(Proxy):
+
+    def __init__(self, host, port, timeout=120, ssl=False, deserialize=True, cookie=None):
+        super(OdooProxy, self).__init__(host, port, timeout=timeout, ssl=ssl, deserialize=deserialize)
+        self.cookie_jar = cookielib.CookieJar()
+        if cookie:
+            self.cookie_jar.set_cookie(cookie)
+        self._opener = urllib2.build_opener(
+            urllib2.HTTPCookieProcessor(self.cookie_jar))
+
+class OdooState(BrowserView):
+
+    implements(IOdooState)
+
+    def __init__(self, context, request):
+        super(OdooState, self).__init__(context, request)
+        ptool = getToolByName(getSite(), 'portal_url')
+        self.portal = ptool.getPortalObject()
+        self.pu = getToolByName(self.portal, "plone_utils")
+        self.portal_url = ptool()
+        self.config = o4pi.IOdooSettings(self.portal)
+        self.plone_view = getMultiAdapter(
+            (self.portal, self.request), name=u"plone")
+        self.lang = self.language()
+        self.proxy = self.getProxy()
+#        self.session_info = self.getSessionInfo()
+#        LOG.info('session_info: '+str(self.session_info))
+        lid = self.request.locale.id
+        self.locale = lid.language
+        if lid.territory:
+            self.locale += '_'+lid.territory
+        self.catalog = getToolByName(self.portal, 'portal_catalog', None)
+
+    def language(self):
+        """
+        @return: Two-letter string, the active language code
+        """
+        context = self.context.aq_inner
+        portal_state = getMultiAdapter((self.portal, self.request), name=u'plone_portal_state')
+        current_language = str(portal_state.language())
+        if '-' in current_language:
+            current_language = current_language.split('-')[0]+'_'+current_language.split('-')[1].upper()
+        return current_language
+
+    def getProxy(self):
+        cookie = self.getSessionCookie()
+        if not cookie:
+            LOG.info('NO Session cookie found')
+            cnt = OdooProxy(host = self.config.http_host,
+                            port = self.config.http_address)
+            session_info = cnt(url='/web/session/get_session_info', params={'context':{'lang':self.lang}})
+            LOG.info(session_info)
+            session_id = session_info['result']['session_id']
+            cookie = cnt.cookie_jar._cookies[self.config.http_host]['/']['session_id']
+            self.request.RESPONSE.setCookie('session_id', cookie.value.replace('"',''), path='/', expires=cookie.expires)
+        else:
+            LOG.info('Session cookie found')
+        cookie.port = str(self.config.http_address)
+        cookie.domain = self.config.http_host
+        cnt = OdooProxy(host = self.config.http_host,
+                        port = self.config.http_address,
+                        cookie=cookie)
+        session_info = cnt(url='/web/session/get_session_info', params={'context':{'lang':self.lang}})
+        LOG.info(session_info)
+        if not session_info.get('db'):
+            LOG.info('setting db for session')
+            session_info = cnt(url='/web/session/authenticate', params={'db':self.config.dbname, 'login':'', 'password':'','context':{'lang':self.lang}})
+        session_info = cnt(url='/web/session/get_shop_session_info', params={'context':{'lang':self.lang}})
+        LOG.info(session_info)
+        return cnt
+
+    def callProxy(self, url, params):
+        if not params.get('context'):
+            params['context'] = {}
+        params['context']['lang'] = self.lang
+        LOG.info('Calling proxy: '+str(url)+' params:'+str(params))
+        resp = self.proxy(url=url, params=params)
+        if resp.get('error'):
+            self.pu.addPortalMessage(_('proxy_message_error', default="There has been an error on the server."), type='error')
+            LOG.info('ERROR with URL:'+str(url)+', params:'+str(params)+'->'+str(resp.get('error')))
+            return None
+        return resp['result']
+        
+    def getSessionCookie(self):
+        session_id = self.request.cookies.get('session_id')
+        if not session_id:
+            return None
+        cookie = cookielib.Cookie(version=0,
+                                  name="session_id",
+                                  value=session_id,
+                                  port=str(self.config.http_address),
+                                  port_specified=False,
+                                  domain=self.config.http_host,
+                                  domain_specified=False,
+                                  domain_initial_dot=False,
+                                  path='/',
+                                  path_specified=True,
+                                  secure=False,
+                                  expires=None,
+                                  discard=True,
+                                  comment=None,
+                                  comment_url=None,
+                                  rest={'HttpOnly': None},
+                                  rfc2109=False)
+        return cookie
+
+    def getSessionInfo(self):
+        if not self.proxy:
+            return {}
+        return self.callProxy(url='/web/session/get_shop_session_info', params={})
+
+    def getCatalogProduct(self, product_id=None):
+        if product_id==None and hasattr(self, 'product_id'):
+            product_id = self.product_id
+        res = self.catalog.searchResults({'product_id':product_id,})
+        if res:
+            return res[0]
+        return None
+    
+    def getCatalogProduct4Variants(self, variants=[]):
+        if not variants and hasattr(self, 'variants'):
+            variants = self.variants
+        res = self.catalog.searchResults({'product_id':variants,})
+        if res:
+            return res[0]
+        return None
+
+    def updateProductData(self, product, product_id):
+        data = self.callProxy('/odoo4plone/product_json', params={'product_id':product_id})
+        for field in [IOdooProductState.get(name) for name in IOdooProductState.names() if schema.interfaces.IField.providedBy(IOdooProductState.get(name))]:
+            setattr(product, field.__name__, data.get(field.__name__))
+
+    @memoize
+    def getOdooProductState(self, product_id):
+#        traceback.print_stack()
+        data = self.callProxy('/odoo4plone/product_json', params={'product_id':product_id})
+        return OdooProductState(data)
+
+    def getOptionLineObject(self, line, product_id):
+        """for optional products"""
+        nline = OptionLine(product_id = product_id)
+        product_state = self.getOdooProductState(product_id)
+        nline.name = product_state.name
+        nline.description = product_state.description and product_state.description or ''
+        nline.attributes = product_state.attributes
+        nline.variants = product_state.variants
+        nline.price = product_state.price
+        nline.price_reduce = product_state.lst_price
+        nline.price_subtotal = 0
+        nline.price_formatted = product_state.price_formatted
+        nline.price_reduce_formatted = product_state.lst_price_formatted
+        nline.price_subtotal_formatted = ''
+        nline.currency_name = line.currency_name
+        nline.set_qty = line.set_qty
+#        nline.set_qty = 0
+        nline.unit = product_state.unit
+#        nline.id = str(line.id)+'.option_'+str(product_id)
+        nline.option_id = str(line.id)+'.option_'+str(product_id)
+        nline.linked_line_id = line.linked_line_id != None and line.linked_line_id or line.id
+        nline.product_state = product_state
+        return nline
+
+    def getAccessoryLineObject(self, line, product_id):
+        """for optional products"""
+        nline = OptionLine(product_id = product_id)
+        product_state = self.getOdooProductState(product_id)
+        nline.name = product_state.name
+        nline.description = product_state.description and product_state.description or ''
+        nline.attributes = product_state.attributes
+        nline.variants = product_state.variants
+        nline.price = product_state.price
+        nline.price_reduce = product_state.lst_price
+        nline.price_subtotal = 0
+        nline.price_formatted = product_state.price_formatted
+        nline.price_reduce_formatted = product_state.lst_price_formatted
+        nline.price_subtotal_formatted = ''
+        nline.currency_name = line.currency_name
+#        nline.set_qty = line.set_qty
+        nline.set_qty = 0
+        nline.unit = product_state.unit
+#        nline.id = str(line.id)+'.option_'+str(product_id)
+#        nline.option_id = str(line.id)+'.option_'+str(product_id)
+#        nline.linked_line_id = line.linked_line_id != None and line.linked_line_id or line.id
+        nline.product_state = product_state
+        return nline
+
+    def getLineObject(self, line):
+        product_id = int(line['product_id'])
+        main_product = True
+        product = self.getCatalogProduct(product_id)
+        if not product:
+            if line['product_variant_ids']:
+                main_product = False
+                product = self.getCatalogProduct4Variants(line['product_variant_ids'])
+        if product:
+            description = product.Description and product.Description or line['description'] and line['description'].replace('\n',', ') or ''
+            name = product.Title and product.Title or line['name']
+            link = product.getURL()
+            if not main_product:
+                link += '?product_id='+str(product_id)
+        else:
+            description = line['description'] and line['description'].replace('\n',', ') or ''
+            name = line['name']
+            link = None
+        attributes = []
+        for attribute in line['attributes'].values():
+            attributes.append(attribute['name']+' : '+attribute['value'])
+        cline = CartLine(id = int(line['id']),
+                         product_id = product_id,
+                         name = name,
+                         description = description,
+                         attributes=line['attributes'],
+                         variants=line['variants'],
+                         link = link,
+                         price = line['price_unit'],
+                         price_reduce = line['price_reduce'],
+                         price_subtotal = line['price_subtotal'],
+                         price_formatted = line['price_unit_formatted'],
+                         price_reduce_formatted = line['price_reduce_formatted'],
+                         price_subtotal_formatted = line['price_subtotal_formatted'],
+                         currency_name = line['currency_name'],
+                         set_qty = line['product_uom_qty'],
+                         unit = line['product_uom'].encode('utf-8'),
+                         linked_line_id = line['linked_line_id'],
+                         option_line_ids = line['option_line_ids'])
+        return cline
+
+    def getLines(self, line=None, line_id=None):
+        lines = []
+        if line_id and not line:
+            line = self.callProxy(url='/odoo4plone/line_json', params={'line_id':line_id})
+        oline = self.getLineObject(line)
+        lines.append(oline)
+        if line.get('options'):
+            for tmplid, pids in line['options'].items():
+                option_line = self.getOptionLineObject(oline, int(pids[0]))
+                option_line.linked_line_id = line['id']
+                lines.append(option_line)
+        if line.get('accessories'):
+            for tmplid, pids in line['accessories'].items():
+                option_line = self.getOptionLineObject(oline, int(pids[0]))
+                option_line.linked_line_id = line['id']
+                lines.append(option_line)
+        return lines
+
+    def getCart(self):
+        data = {}
+        values = self.callProxy(url='/odoo4plone/cart_json', params={})
+        LOG.info(values)
+        if not values:
+            return None
+        lines = []
+        treated = []
+        for line in values['lines']:
+            #this line is an option
+            if line['id'] in treated:
+                continue
+            if line['linked_line_id']:
+                option_id = str(line['linked_line_id'][0])+'.option_'+str(line['product_id'])
+                if option_id in treated:
+                    continue
+                treated.append(option_id)
+            
+            bcartline = self.getLineObject(line)
+            lines.append(bcartline)
+            treated.append(line['id'])
+            if line['option_line_ids']:
+                for oline in [a for a in values['lines'] if a['id'] in [int(k) for k in line['option_line_ids'].keys()]]:
+                    option_id = str(line['id'])+'.option_'+str(oline['product_id'])
+                    if oline['id'] in treated or option_id in treated:
+                        continue
+                    cartline = self.getLineObject(oline)
+                    lines.append(cartline)
+                    treated.append(oline['id'])
+                    treated.append(option_id)
+            LOG.info(treated)
+            if line.get('options'):
+                for tmplid, pids in line['options'].items():
+                    tmpl_treated = False
+                    for pid in pids:
+                        if str(line['id'])+'.option_'+str(pid) in treated:
+                            tmpl_treated = True
+                            break
+                    if tmpl_treated:
+                        continue
+                    option_id = str(line['id'])+'.option_'+str(pids[0])
+                    option_line = self.getOptionLineObject(bcartline, int(pids[0]))
+                    option_line.linked_line_id = line['id']
+                    lines.append(option_line)
+                    treated.append(option_id)
+            if line.get('accessories'):
+                for tmplid, pids in line['accessories'].items():
+                    tmpl_treated = False
+                    for pid in pids:
+                        if str(line['id'])+'.option_'+str(pid) in treated:
+                            tmpl_treated = True
+                            break
+                    if tmpl_treated:
+                        continue
+                    option_id = str(line['id'])+'.option_'+str(pids[0])
+                    option_line = self.getAccessoryLineObject(bcartline, int(pids[0]))
+                    option_line.linked_line_id = line['id']
+                    lines.append(option_line)
+                    treated.append(option_id)
+            LOG.info(treated)
+        data = {'currency': unicode(values['order']['currency_name']),
+                'amount_untaxed':values['order']['amount_untaxed'],
+                'amount_tax':values['order']['amount_tax'],
+                'amount_total':values['order']['amount_total'],
+                'amount_untaxed_formatted':values['order']['amount_untaxed_formatted'],
+                'amount_tax_formatted':values['order']['amount_tax_formatted'],
+                'amount_total_formatted':values['order']['amount_total_formatted'],
+                'lines':lines}
+        return Cart(**data)
+
+    def updateCart(self, product_id, add_qty=None, set_qty=None, **kwargs):
+        values = {'product_id':product_id,
+                  'add_qty':add_qty,
+                  'set_qty':set_qty}
+        values.update(kwargs)
+        return self.callProxy(url='/odoo4plone/cart/update_json', params=values)
+
